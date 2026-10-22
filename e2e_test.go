@@ -1096,6 +1096,9 @@ func TestNewRoundTripperFailsWhenDestinationUnreachable(t *testing.T) {
 // An unused round tripper holds a stream until it's closed. A race that discards its losers
 // must get those streams back, or the session runs out of them for good.
 func TestClosedRoundTrippersGiveBackTheirStreams(t *testing.T) {
+	// Only Close may give the streams back here, not their expiry.
+	defer func(ttl time.Duration) { preDialedTTL = ttl }(preDialedTTL)
+	preDialedTTL = time.Hour
 	srv, pub := startServer(t)
 	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(hs.Close)
