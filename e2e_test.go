@@ -1093,6 +1093,64 @@ func TestNewRoundTripperFailsWhenDestinationUnreachable(t *testing.T) {
 	}
 }
 
+// An unused round tripper holds a stream until it's closed. A race that discards its losers
+// must get those streams back, or the session runs out of them for good.
+func TestClosedRoundTrippersGiveBackTheirStreams(t *testing.T) {
+	// Only Close may give the streams back here, not their expiry.
+	defer func(ttl time.Duration) { preDialedTTL = ttl }(preDialedTTL)
+	preDialedTTL = time.Hour
+	srv, pub := startServer(t)
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(hs.Close)
+	addr := strings.TrimPrefix(hs.URL, "http://")
+	c, _ := NewClient(Config{Zone: testZone, ServerKey: pub, Resolvers: []string{srv}, MaxStreams: 2})
+	defer c.Close()
+	for range 2 {
+		rt, err := c.NewRoundTripper(context.Background(), addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rt.(io.Closer).Close()
+	}
+	if _, err := connectWithin(c, addr, 10*time.Second); err != nil {
+		t.Fatalf("connecting after closing every unused round tripper: %v", err)
+	}
+}
+
+func TestUnusedRoundTripperGivesBackItsStream(t *testing.T) {
+	defer func(ttl time.Duration) { preDialedTTL = ttl }(preDialedTTL)
+	preDialedTTL = 200 * time.Millisecond
+	srv, pub := startServer(t)
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(hs.Close)
+	addr := strings.TrimPrefix(hs.URL, "http://")
+	c, _ := NewClient(Config{Zone: testZone, ServerKey: pub, Resolvers: []string{srv}, MaxStreams: 2})
+	defer c.Close()
+	for range 2 {
+		if _, err := c.NewRoundTripper(context.Background(), addr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := connectWithin(c, addr, 10*time.Second); err != nil {
+		t.Fatalf("connecting after the unused round trippers expired: %v", err)
+	}
+}
+
+// connectWithin retries NewRoundTripper until it succeeds: a closed stream gives back its slot
+// only once the server acknowledges its FIN.
+func connectWithin(c *Client, addr string, d time.Duration) (http.RoundTripper, error) {
+	deadline := time.Now().Add(d)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		rt, err := c.NewRoundTripper(ctx, addr)
+		cancel()
+		if err == nil || time.Now().After(deadline) {
+			return rt, err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // errInjector forwards to server but first answers every query with a forged error.
 func errInjector(t *testing.T, server string, rcode byte, tc bool) string {
 	front, _ := net.ListenPacket("udp", "127.0.0.1:0")
