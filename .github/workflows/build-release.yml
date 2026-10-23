@@ -1,0 +1,150 @@
+name: Build Soar release binaries
+
+# Forks do not receive upstream "release" events, so this workflow polls
+# getlantern/soar for its latest release and builds it when your fork does not
+# have a release with that tag yet. You can also run it by hand (Actions tab ->
+# "Build Soar release binaries" -> Run workflow) and optionally name a tag.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build, e.g. v0.2.4 (blank = latest upstream release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild and replace the release even if it already exists in this fork"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: getlantern/soar
+
+jobs:
+  check:
+    name: Find upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            tag=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists in $GITHUB_REPOSITORY, nothing to do."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will build $tag"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Check out upstream source at the release tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+
+      - name: Set up Go (version taken from go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build optimized binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: v1          # most compatible; see notes (v3 is faster on modern CPUs)
+        run: |
+          set -euo pipefail
+          name="soar-${TAG}-${GOOS}-${GOARCH}"
+          mkdir -p "dist/${name}"
+          # Builds every main package under ./cmd (soar-server, and any others).
+          # -s -w strips symbol/DWARF tables, -trimpath/-buildid= make the build
+          # reproducible, CGO off gives a fully static binary.
+          go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -buildid=" \
+            -o "dist/${name}/" ./cmd/...
+          cp -f LICENSE* README* "dist/${name}/" 2>/dev/null || true
+          ls -l "dist/${name}"
+          cd dist
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r -9 "${name}.zip" "${name}"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: soar-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish release in this fork
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create (or replace) the release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ github.sha }}" \
+            --title "Soar $TAG" \
+            --notes "Pre-built binaries (Linux amd64, Windows amd64) of upstream [${UPSTREAM}](https://github.com/${UPSTREAM}/releases/tag/${TAG}) ${TAG}. Built from the upstream tag, static (CGO disabled), stripped. Verify with SHA256SUMS.txt."
